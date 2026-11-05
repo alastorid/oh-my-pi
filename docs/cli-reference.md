@@ -85,6 +85,7 @@ Argument handling:
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--continue`, `-c`                      | Continue the previous session.                                                                                                                                                                                                                                                                                |
 | `--resume [id]`, `-r`, `--session [id]` | Resume a session by ID prefix or path, or open the picker when no value is given.                                                                                                                                                                                                                             |
+| `--session-id <uuid>`                   | Create or resume the persistent session with this exact UUID, within the selected profile and session storage.                                                                                                                                                                                               |
 | `--restore [id]`                        | Resume a session as `--resume` does, then go on with what its last process left unfinished when it crashed or was killed: the interrupted turn and the subagents it was running. Interactive only; takes no prompt. See [session operations](./session-operations-export-share-fork-resume.md#cli---restore). |
 | `--fork <session>`                      | Fork a saved session (by ID prefix or path) into a new session. See [session operations](./session-operations-export-share-fork-resume.md).                                                                                                                                                                   |
 | `--from-claude`                         | Import a Claude Code session into OMP.                                                                                                                                                                                                                                                                        |
@@ -96,6 +97,13 @@ Argument handling:
 persistence and cannot use `--no-session`. `--from-claude` and `--from-codex`
 are mutually exclusive and cannot be combined with `--continue`, `--resume`,
 or `--fork`.
+
+`--session-id` accepts a canonical UUID (for example,
+`omp --session-id 550e8400-e29b-41d4-a716-446655440000`). Repeating the command
+opens the same conversation even from another working directory. It cannot be
+combined with another session selector, an import, `--goal`, or `--no-session`.
+Use `--profile` or `--session-dir` to select a separate storage namespace.
+ACP mode creates sessions through its client and does not support this flag.
 
 #### Model selection
 

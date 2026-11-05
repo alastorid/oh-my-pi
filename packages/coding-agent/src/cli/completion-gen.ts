@@ -74,6 +74,7 @@ const DIR_FLAGS: Record<string, true> = { "session-dir": true, "plugin-dir": tru
 function flagValue(name: string, desc: FlagDescriptor): ValueSource {
 	if (desc.kind === "boolean") return { kind: "flag" };
 	if (desc.options && desc.options.length > 0) return { kind: "enum", values: desc.options };
+	if (name === "session-id") return { kind: "value" };
 	if (MODEL_FLAGS[name]) return { kind: "models", multiple: false };
 	if (name === "models") return { kind: "models", multiple: true };
 	if (SESSION_FLAGS[name]) return { kind: "sessions" };

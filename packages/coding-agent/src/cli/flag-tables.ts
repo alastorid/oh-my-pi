@@ -226,6 +226,13 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	"--provider-session-id": (result, value) => {
 		result.providerSessionId = value;
 	},
+	"--session-id": (result, value) => {
+		if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
+			throw new CliUsageError("--session-id requires a canonical UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).");
+		}
+		if (result.sessionId !== undefined) throw new CliUsageError("--session-id may only be specified once.");
+		result.sessionId = value.toLowerCase();
+	},
 	"--prompt-cache-key": (result, value) => {
 		result.providerPromptCacheKey = value;
 	},
@@ -429,6 +436,7 @@ const ONE_SHOT_LAUNCH_FLAGS: Readonly<Record<string, true>> = {
 	"-r": true,
 	"--restore": true,
 	"--session": true,
+	"--session-id": true,
 	"--continue": true,
 	"-c": true,
 	"--fork": true,
@@ -458,14 +466,20 @@ export function restartArgv(
 	argv: string[],
 	resumeSessionSource: string | undefined,
 	drop?: Readonly<Record<string, true>>,
+	activeSessionId?: string,
 ): string[] {
 	const kept: string[] = [];
+	let explicitSessionId: string | undefined;
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
 		if (arg === "--") break; // end-of-options: the rest is literal prompt text
 		if (!arg.startsWith("-")) continue; // positional: prompt message, @file, or subcommand
 		const consumesNext = flagConsumesValue(arg, argv[i + 1]);
 		const flag = arg.startsWith("--") ? arg.split("=", 1)[0] : arg;
+		if (flag === "--session-id") {
+			const supplied = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : argv[i + 1];
+			if (supplied?.toLowerCase() === activeSessionId?.toLowerCase()) explicitSessionId = activeSessionId;
+		}
 		if (Object.hasOwn(ONE_SHOT_LAUNCH_FLAGS, flag) || (drop !== undefined && Object.hasOwn(drop, flag))) {
 			if (consumesNext) i++;
 			continue;
@@ -473,6 +487,7 @@ export function restartArgv(
 		kept.push(arg);
 		if (consumesNext) kept.push(argv[++i]);
 	}
-	if (resumeSessionSource !== undefined) kept.push("--resume", resumeSessionSource);
+	if (explicitSessionId !== undefined) kept.push("--session-id", explicitSessionId);
+	else if (resumeSessionSource !== undefined) kept.push("--resume", resumeSessionSource);
 	return kept;
 }

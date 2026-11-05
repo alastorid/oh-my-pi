@@ -72,6 +72,10 @@ export interface Args {
 	mode?: Mode;
 	noSession?: boolean;
 	sessionDir?: string;
+	/** Exact, persistent session identity supplied by the caller. */
+	sessionId?: string;
+	/** Internal startup state: the explicitly identified session already existed. */
+	explicitSessionResumed?: boolean;
 	providerSessionId?: string;
 	providerPromptCacheKey?: string;
 	fork?: string;
@@ -146,6 +150,30 @@ export function validateGoalLaunch(args: Args, interactive: boolean): void {
 	}
 	if (args.continue || args.resume || args.fork || args.fromClaude || args.fromCodex) {
 		throw new CliUsageError("--goal requires a fresh session (no resume, continue, fork, or import).");
+	}
+}
+
+/** Reject selectors which would make an explicit session identity ambiguous. */
+export function validateExplicitSessionLaunch(args: Args): void {
+	if (args.sessionId === undefined) return;
+	if (args.mode === "acp") {
+		throw new CliUsageError("--session-id is not supported in ACP mode, which creates sessions through the client.");
+	}
+	if (
+		args.continue ||
+		args.resume !== undefined ||
+		args.restore ||
+		args.fork ||
+		args.fromClaude ||
+		args.fromCodex ||
+		args.noSession ||
+		args.goal !== undefined ||
+		args.export ||
+		args.join
+	) {
+		throw new CliUsageError(
+			"--session-id cannot be combined with --continue, --resume, --session, --restore, --fork, imports, --no-session, --goal, --export, or join.",
+		);
 	}
 }
 
@@ -295,7 +323,7 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		// the following token — eating the user's message and setting the wrong
 		// built-in field — so registered flags shadow same-named built-ins here.
 		const extFlag = arg.startsWith("--") ? extensionFlags?.get(arg.slice(2)) : undefined;
-		if (extFlag) {
+		if (extFlag && arg !== "--session-id") {
 			const flagName = arg.slice(2);
 			if (extFlag.type === "boolean") {
 				result.unknownFlags.set(flagName, true);
@@ -309,6 +337,9 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			}
 		} else if (STRING_VALUE_FLAGS.has(arg)) {
 			if (arg === "--trusted-extension") trustedFlagCount++;
+			if (arg === "--session-id" && (i + 1 >= args.length || args[i + 1] === PROFILE_BOOTSTRAP_BOUNDARY_ARG)) {
+				throw new CliUsageError("--session-id requires a UUID.");
+			}
 			// Built-in string flags consume the next token even when it is flag-looking
 			// (`--system-prompt --profile foo` ⇒ the prompt is the literal "--profile").
 			// The one token they must never absorb is the profile bootstrap's internal

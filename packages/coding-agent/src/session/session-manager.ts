@@ -125,6 +125,7 @@ import {
 	type SessionStorage,
 	type SessionStorageWriter,
 	SessionWriteConflictError,
+	tryAcquireSessionLease,
 } from "./session-storage";
 import { type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
 import {
@@ -934,6 +935,43 @@ export class ForkSourceNotFoundError extends Error {
  * A trailing atomic rewrite still rewrites the header cwd after the path is
  * repointed.
  */
+/** Enumerate every native transcript so custom-named files and duplicates count too.
+ * The title index is best-effort and does not map identities to paths. */
+async function explicitSessionFiles(root: string, singleDirectory: boolean): Promise<string[]> {
+	let dirs: string[];
+	try {
+		if (singleDirectory) dirs = [root];
+		else
+			dirs = (await fs.promises.readdir(root, { withFileTypes: true }))
+				.filter(entry => entry.isDirectory())
+				.map(entry => path.join(root, entry.name));
+	} catch (error) {
+		if (isEnoent(error)) return [];
+		throw error;
+	}
+	const seen = new Set<string>();
+	const files: string[] = [];
+	for (const dir of dirs) {
+		let names: string[];
+		try {
+			names = await fs.promises.readdir(dir);
+		} catch (error) {
+			if (isEnoent(error)) continue;
+			throw error;
+		}
+		for (const name of names) {
+			if (!name.toLowerCase().endsWith(".jsonl")) continue;
+			const file = path.join(dir, name);
+			const real = await fs.promises.realpath(file);
+			if (!seen.has(real)) {
+				seen.add(real);
+				files.push(file);
+			}
+		}
+	}
+	return files;
+}
+
 export class SessionManager {
 	#cwd: string;
 	/** Additional workspace directories beyond cwd (multi-root). Normalized absolute, deduped, excludes cwd. */
@@ -945,6 +983,8 @@ export class SessionManager {
 	readonly #blobs: BlobStore;
 
 	#sessionId = "";
+	/** Explicit identities must never be silently moved to a new session. */
+	#explicitIdentity = false;
 	/**
 	 * Parent-derived sibling family candidate stashed by the Task executor once
 	 * the child session exists. Session-scoped and non-persisted: the header
@@ -1190,6 +1230,7 @@ export class SessionManager {
 	#conflictedSessionFile(error: unknown): string | undefined {
 		const sessionFile = this.#sessionFile;
 		if (
+			this.#explicitIdentity ||
 			!(error instanceof SessionWriteConflictError) ||
 			error.expectedSize === null ||
 			!sessionFile ||
@@ -1315,6 +1356,10 @@ export class SessionManager {
 	 * await it. Returns the sibling.
 	 */
 	#moveOffSessionFile(reason: SessionPersistenceNotice["reason"]): string {
+		if (this.#explicitIdentity)
+			throw new Error(
+				`Explicit session ${this.#sessionId} cannot be moved after a persistence conflict (${reason}).`,
+			);
 		const from = this.#sessionFile as string;
 		const previousSessionId = this.#sessionId;
 		const timestamp = nowIso();
@@ -2057,16 +2102,25 @@ export class SessionManager {
 		}
 	}
 
-	#resetToNewSession(options?: NewSessionOptions, forcedSessionFile?: string): string | undefined {
+	#resetToNewSession(
+		options?: NewSessionOptions,
+		forcedSessionFile?: string,
+		forcedSessionId?: string,
+	): string | undefined {
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
 		this.#expectedDiskSize = null;
+		if (this.#explicitIdentity) {
+			this.#sessionClaim?.release?.();
+			this.#sessionClaim = undefined;
+		}
 		this.#reconcileSessionDirForFallback();
 		if (options?.sessionDir && this.#persist) {
 			this.#sessionDir = path.resolve(options.sessionDir);
 			this.#storage.ensureDirSync(this.#sessionDir);
 		}
-		this.#sessionId = mintSessionId();
+		this.#explicitIdentity = false;
+		this.#sessionId = forcedSessionId ?? mintSessionId();
 		this.#taskSiblingCandidate = undefined;
 		this.#sessionName = undefined;
 		this.#titleSource = undefined;
@@ -2405,6 +2459,7 @@ export class SessionManager {
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#draftOnlySessionCleanupArmed = false;
+		this.#explicitIdentity = false;
 		// A switch gives up the previous file. Opening claims nothing: the first
 		// write does, so inspecting a session never counts as owning it.
 		this.#sessionClaim?.release?.();
@@ -2529,8 +2584,13 @@ export class SessionManager {
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#reconcileSessionDirForFallback();
+		if (this.#explicitIdentity) {
+			this.#sessionClaim?.release?.();
+			this.#sessionClaim = undefined;
+		}
 
 		const timestamp = nowIso();
+		this.#explicitIdentity = false;
 		this.#sessionId = mintSessionId();
 		this.#taskSiblingCandidate = undefined;
 		this.#sessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
@@ -2992,54 +3052,63 @@ export class SessionManager {
 		if (!this.#persist) return;
 		// Closing gives up this process's ownership claim; a later write reclaims it.
 		const claim = this.#sessionClaim;
-		claim?.release?.();
-		if (claim) claim.release = undefined;
-		// A prior `flushSync` can self-conflict with this manager's own
-		// unconfirmed deferred publish; drain despite the latch so that
-		// publish can still confirm before we give up on the transcript.
-		await this.#scheduleDiskWork(
-			async () => {
-				const hadWriter = this.#writer !== undefined;
-				await this.#closeWriterHandle();
-				if (hadWriter || (this.#sessionFile && this.#storage.existsSync(this.#sessionFile)))
-					this.#fileIsCurrent = true;
-			},
-			{ ignorePriorError: true },
-		);
-		await this.#pendingArtifactCopy?.done;
-		await this.#dropIfEmptyAndNoDraft();
-		// Wait for any queued backing writes (IndexedSessionStorage per-path
-		// tail) to become durable so a graceful shutdown does not exit while
-		// a fire-and-forget publish is still on the wire.
-		await this.#scheduleDiskWork(
-			async () => {
-				await this.#storage.drain();
-			},
-			{ ignorePriorError: true },
-		);
-		if (
-			this.#diskFailure &&
-			this.#sessionFile &&
-			this.#storage.defersSyncPublish &&
-			!this.#entriesReleased &&
-			this.#shouldHaveSessionFile()
-		) {
-			// Deferred-publish only: a synchronous backend's drain() is a
-			// no-op, so any failure there is a genuine external conflict or a
-			// permanent write failure, not a self-race this retry can catch
-			// up on. seal() disabled the ordinary mid-life repair path, so
-			// close() issues the terminal write directly instead.
-			const operationError = this.#diskFailure;
-			const sessionFile = this.#sessionFile;
+		if (!this.#explicitIdentity) {
+			claim?.release?.();
+			if (claim) claim.release = undefined;
+		}
+		try {
+			// A prior `flushSync` can self-conflict with this manager's own
+			// unconfirmed deferred publish; drain despite the latch so that
+			// publish can still confirm before we give up on the transcript.
 			await this.#scheduleDiskWork(
 				async () => {
-					await this.#publishAuthoritativeBody(sessionFile, operationError);
-					this.#clearDiskError();
+					const hadWriter = this.#writer !== undefined;
+					await this.#closeWriterHandle();
+					if (hadWriter || (this.#sessionFile && this.#storage.existsSync(this.#sessionFile)))
+						this.#fileIsCurrent = true;
 				},
 				{ ignorePriorError: true },
-			).catch(() => undefined);
+			);
+			await this.#pendingArtifactCopy?.done;
+			await this.#dropIfEmptyAndNoDraft();
+			// Wait for any queued backing writes (IndexedSessionStorage per-path
+			// tail) to become durable so a graceful shutdown does not exit while
+			// a fire-and-forget publish is still on the wire.
+			await this.#scheduleDiskWork(
+				async () => {
+					await this.#storage.drain();
+				},
+				{ ignorePriorError: true },
+			);
+			if (
+				this.#diskFailure &&
+				this.#sessionFile &&
+				this.#storage.defersSyncPublish &&
+				!this.#entriesReleased &&
+				this.#shouldHaveSessionFile()
+			) {
+				// Deferred-publish only: a synchronous backend's drain() is a
+				// no-op, so any failure there is a genuine external conflict or a
+				// permanent write failure, not a self-race this retry can catch
+				// up on. seal() disabled the ordinary mid-life repair path, so
+				// close() issues the terminal write directly instead.
+				const operationError = this.#diskFailure;
+				const sessionFile = this.#sessionFile;
+				await this.#scheduleDiskWork(
+					async () => {
+						await this.#publishAuthoritativeBody(sessionFile, operationError);
+						this.#clearDiskError();
+					},
+					{ ignorePriorError: true },
+				).catch(() => undefined);
+			}
+			if (this.#diskFailure) throw this.#diskFailure;
+		} finally {
+			if (this.#explicitIdentity && claim?.release) {
+				claim.release();
+				claim.release = undefined;
+			}
 		}
-		if (this.#diskFailure) throw this.#diskFailure;
 	}
 
 	/**
@@ -4166,8 +4235,18 @@ export class SessionManager {
 			parentId = labelEntry.id;
 		}
 
+		if (this.#explicitIdentity) {
+			// This synchronous boundary must cancel queued old-file rewrites before
+			// releasing the lease; its file backend has synchronous appends.
+			this.flushSync();
+			this.#diskEpoch++;
+			this.#closeWriterEventually();
+			this.#sessionClaim?.release?.();
+			this.#sessionClaim = undefined;
+		}
 		this.#header = header;
 		this.#entries = [...entriesToKeep, ...labels];
+		this.#explicitIdentity = false;
 		this.#sessionId = newSessionId;
 		this.#taskSiblingCandidate = undefined;
 		this.#sessionName = header.title;
@@ -4218,6 +4297,97 @@ export class SessionManager {
 		const manager = new SessionManager(cwd, dir, true, storage);
 		manager.#resetToNewSession();
 		return manager;
+	}
+
+	/** Open exactly this persistent identity, or create it durably when absent. */
+	static async createOrResumeExplicit(
+		id: string,
+		cwd: string,
+		sessionDir?: string,
+	): Promise<{ manager: SessionManager; resumed: boolean }> {
+		if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+			throw new Error(`Invalid session ID "${id}": expected a canonical UUID.`);
+		}
+		id = id.toLowerCase();
+		// Claim before the lookup, not at the first append: concurrent creators must
+		// never observe absence and publish independently. A lease failure is fatal.
+		const lease = tryAcquireSessionLease(id);
+		if (!lease) throw new Error(`Session ${id} is already open in another process.`);
+		let manager: SessionManager | undefined;
+		try {
+			const storage = new FileSessionStorage();
+			const root = sessionDir ? path.resolve(sessionDir) : getSessionsDir();
+			const files = await explicitSessionFiles(root, !!sessionDir);
+			const matches: string[] = [];
+			for (const file of files) {
+				const namedForId = path.basename(file).toLowerCase().endsWith(`_${id}.jsonl`);
+				const headerId = await readSessionHeaderId(file);
+				// A file removed during lookup must not turn a possible match into absence.
+				if (headerId === undefined) await fs.promises.stat(file);
+				if (!namedForId && headerId?.toLowerCase() !== id) continue;
+				const loaded = parseSessionContent(await Bun.file(file).text());
+				const header = loaded.entries[0] as SessionHeader | undefined;
+				if (namedForId && (loaded.invalidHeader || headerId?.toLowerCase() !== id)) {
+					throw new Error(`Cannot resume session ${id}: invalid or mismatched header in ${file}.`);
+				}
+				if (header?.type !== "session" || headerId?.toLowerCase() !== id) continue;
+				if (headerId !== id)
+					throw new Error(
+						`Cannot resume session ${id}: the stored identity is not canonical lowercase in ${file}.`,
+					);
+				const version = header.version ?? 1;
+				if (
+					loaded.invalidHeader ||
+					loaded.malformedRecords ||
+					!Number.isInteger(version) ||
+					version < 1 ||
+					version > CURRENT_SESSION_VERSION ||
+					typeof header.timestamp !== "string" ||
+					typeof header.cwd !== "string" ||
+					loaded.entries
+						.slice(1)
+						.some(
+							entry =>
+								!entry ||
+								typeof entry !== "object" ||
+								typeof entry.type !== "string" ||
+								(version >= 2 &&
+									(typeof entry.id !== "string" ||
+										!("parentId" in entry) ||
+										(entry.parentId !== null && typeof entry.parentId !== "string"))),
+						)
+				) {
+					throw new Error(`Cannot resume session ${id}: corrupt or incompatible session file ${file}.`);
+				}
+				matches.push(file);
+			}
+			if (matches.length > 1) throw new Error(`Cannot resume session ${id}: multiple session files have this ID.`);
+			const resumed = matches.length === 1;
+			if (resumed) {
+				manager = await SessionManager.open(matches[0], sessionDir, storage, {
+					initialCwd: cwd,
+					throwIfMissing: true,
+				});
+				if (
+					manager.getSessionId() !== id ||
+					manager.#loadedMalformedRecords ||
+					(manager.#header.version ?? 1) > CURRENT_SESSION_VERSION
+				) {
+					throw new Error(`Session ${id} changed or became corrupt while loading.`);
+				}
+			} else {
+				const dir = sessionDir ? path.resolve(sessionDir) : path.join(root, "explicit");
+				manager = new SessionManager(cwd, dir, true, storage);
+				manager.#resetToNewSession(undefined, path.join(dir, `explicit_${id}.jsonl`), id);
+			}
+			manager.#explicitIdentity = true;
+			manager.#sessionClaim = { sessionId: id, release: () => lease.release() };
+			if (!resumed) await manager.ensureOnDisk();
+			return { manager, resumed };
+		} catch (error) {
+			lease.release();
+			throw error;
+		}
 	}
 
 	/**

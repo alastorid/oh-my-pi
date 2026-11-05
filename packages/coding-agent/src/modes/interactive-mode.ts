@@ -8329,6 +8329,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				process.argv.slice(2),
 				sessionFile ? path.resolve(sessionFile) : undefined,
 				activeProfile ? { "--profile": true } : undefined,
+				this.sessionManager.getSessionId(),
 			),
 		];
 		if (activeProfile) cmd.push("--profile", activeProfile);

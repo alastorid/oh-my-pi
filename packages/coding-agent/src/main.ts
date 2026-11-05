@@ -30,6 +30,7 @@ import {
 	type Args,
 	reportInvalidFlagValues,
 	reportUnrecognizedFlags,
+	validateExplicitSessionLaunch,
 	validateGoalLaunch,
 	validateGoalStartup,
 	validateRestoreLaunch,
@@ -1263,6 +1264,16 @@ export async function createSessionManager(
 		onSessionContinuation?: (continuation: SessionContinuation) => void;
 	} = {},
 ): Promise<SessionManager | undefined> {
+	validateExplicitSessionLaunch(parsed);
+	if (parsed.sessionId !== undefined) {
+		const { manager, resumed } = await SessionManager.createOrResumeExplicit(
+			parsed.sessionId,
+			cwd,
+			parsed.sessionDir,
+		);
+		parsed.explicitSessionResumed = resumed;
+		return manager;
+	}
 	if (parsed.fork) {
 		if (parsed.noSession) {
 			throw new SessionResolutionError("--fork requires session persistence");
@@ -1428,7 +1439,9 @@ export async function buildSessionOptions(
 		cwd: parsed.cwd ?? getProjectDir(),
 		autoApprove: parsed.autoApprove ?? false,
 	};
-	const restoringSession = Boolean(parsed.continue || parsed.resume || isForeignSessionImport(parsed));
+	const restoringSession = Boolean(
+		parsed.continue || parsed.resume || parsed.explicitSessionResumed || isForeignSessionImport(parsed),
+	);
 	if (parsed.serviceTier !== undefined) {
 		options.openAIServiceTier = serviceTierSettingToTier(parsed.serviceTier) ?? null;
 	}
@@ -1848,6 +1861,7 @@ export async function runRootCommand(
 		}
 
 		if (parsedArgs.export) {
+			validateExplicitSessionLaunch(parsedArgs);
 			// Export loads no extensions, so none can own a value the bootstrap parse
 			// rejected: report it as the usage error it is instead of exporting.
 			if (reportInvalidFlagValues(parsedArgs)) {
@@ -1926,6 +1940,7 @@ export async function runRootCommand(
 		// transcripts (or an opened picker) behind a usage error.
 		validateGoalLaunch(parsedArgs, isInteractive);
 		validateRestoreLaunch(parsedArgs, isInteractive);
+		validateExplicitSessionLaunch(parsedArgs);
 		// Without piped text the prompt must come from argv, which only the
 		// post-extension reparse can settle: an extension string flag's value
 		// (`--spawn-peer reviewer`) looks like a prompt here, and a boolean flag
@@ -2117,6 +2132,7 @@ export async function runRootCommand(
 			parsedArgs.resume ||
 			parsedArgs.fork ||
 			parsedArgs.restore ||
+			parsedArgs.sessionId ||
 			isForeignSessionImport(parsedArgs),
 		);
 		let sessionManager: SessionManager | undefined;
@@ -2205,7 +2221,11 @@ export async function runRootCommand(
 		// Only createSessionManager's implicit auto-resume promotes continue here.
 		const autoResumed = !explicitSessionSelection && parsedArgs.continue === true;
 
-		if ((typeof parsedArgs.resume === "string" || foreignSource) && sessionManager && !parsedArgs.noSession) {
+		if (
+			(typeof parsedArgs.resume === "string" || parsedArgs.explicitSessionResumed || foreignSource) &&
+			sessionManager &&
+			!parsedArgs.noSession
+		) {
 			const previousCwd = cwd;
 			const recordedCwd = sessionManager.getRecordedCwd() ?? sessionManager.getCwd();
 			const resumedProject = await switchToResumedProject(
@@ -2325,7 +2345,14 @@ export async function runRootCommand(
 			if (isInteractive) notifs.push({ kind: "warn", message: notice });
 			else process.stderr.write(`${chalk.yellow(notice)}\n`);
 		}
-		if (sessionManager && (parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource)) {
+		if (
+			sessionManager &&
+			(parsedArgs.continue ||
+				parsedArgs.resume ||
+				parsedArgs.explicitSessionResumed ||
+				parsedArgs.fork ||
+				foreignSource)
+		) {
 			const pendingToolWarning = describePendingToolCalls(sessionManager.getBranch());
 			if (pendingToolWarning) {
 				logger.warn("Resumed session has pending tool calls", {
@@ -2498,7 +2525,14 @@ export async function runRootCommand(
 				isInteractive &&
 				parsedArgs.unrecognizedFlags.length === 0 &&
 				!parsedArgs.tools?.length &&
-				!(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || parsedArgs.restore || foreignSource);
+				!(
+					parsedArgs.continue ||
+					parsedArgs.resume ||
+					parsedArgs.explicitSessionResumed ||
+					parsedArgs.fork ||
+					parsedArgs.restore ||
+					foreignSource
+				);
 			const extensionsResult = parsedArgs.trustedExtensions?.length
 				? { ...(await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus)), deferredPaths: [] }
 				: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus, {
@@ -2576,7 +2610,13 @@ export async function runRootCommand(
 			const showStartupSplash = shouldShowStartupSplash({
 				configured: cfgStartupShowSplash.get(settingsInstance),
 				isInteractive,
-				resuming: Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
+				resuming: Boolean(
+					parsedArgs.continue ||
+					parsedArgs.resume ||
+					parsedArgs.explicitSessionResumed ||
+					parsedArgs.fork ||
+					foreignSource,
+				),
 				quiet: cfgStartupQuiet.get(settingsInstance),
 				timing: Boolean($env.PI_TIMING),
 				stdinIsTTY: process.stdin.isTTY,
@@ -2608,7 +2648,13 @@ export async function runRootCommand(
 			}
 			// Resumed and imported sessions neither show nor advance the startup changelog.
 			const showsStartupChangelog =
-				isInteractive && !(parsedArgs.continue || parsedArgs.resume || isForeignSessionImport(parsedArgs));
+				isInteractive &&
+				!(
+					parsedArgs.continue ||
+					parsedArgs.resume ||
+					parsedArgs.explicitSessionResumed ||
+					isForeignSessionImport(parsedArgs)
+				);
 
 			const preloadProviderRegistrations =
 				isInteractive && autoResumed ? extensionsResult.runtime.pendingProviderRegistrations.slice() : [];
