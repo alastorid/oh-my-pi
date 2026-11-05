@@ -18,6 +18,7 @@ describe("explicit session identity", () => {
 		expect(first.manager.getHeader()?.id).toBe(ID);
 		const file = first.manager.getSessionFile()!;
 		expect(parseSessionContent(await Bun.file(file).text()).entries[0]?.id).toBe(ID);
+		first.manager.appendMessage({ role: "user", content: "remember this conversation", timestamp: 1 });
 		first.manager.appendCustomEntry("explicit-test", { value: "retained" });
 		await first.manager.flush();
 		await first.manager.close();
@@ -26,12 +27,22 @@ describe("explicit session identity", () => {
 		expect(second.resumed).toBe(true);
 		expect(second.manager.getSessionId()).toBe(ID);
 		expect(second.manager.getSessionFile()).toBe(file);
+		expect(second.manager.buildSessionContext().messages).toContainEqual({
+			role: "user",
+			content: "remember this conversation",
+			timestamp: 1,
+		});
 		expect(
 			second.manager.getEntries().some(entry => entry.type === "custom" && entry.customType === "explicit-test"),
 		).toBe(true);
 		await second.manager.close();
 		const third = await SessionManager.createOrResumeExplicit(ID, temp.path(), dir);
 		expect(third.resumed).toBe(true);
+		expect(third.manager.buildSessionContext().messages).toContainEqual({
+			role: "user",
+			content: "remember this conversation",
+			timestamp: 1,
+		});
 		expect(
 			third.manager.getEntries().some(entry => entry.type === "custom" && entry.customType === "explicit-test"),
 		).toBe(true);
@@ -56,6 +67,34 @@ describe("explicit session identity", () => {
 		await Bun.write(file, original);
 		await Bun.write(path.join(dir, "duplicate.jsonl"), original);
 		await expect(SessionManager.createOrResumeExplicit(ID, temp.path(), dir)).rejects.toThrow("multiple");
+	});
+
+	it("lists an explicit session in its original project and resolves it from another project", async () => {
+		using temp = TempDir.createSync("@explicit-session-list-");
+		const modulePath = path.join(import.meta.dir, "../../src/session/session-manager.ts");
+		const script = `import { SessionManager } from ${JSON.stringify(modulePath)};
+			const id = process.env.TEST_ID, cwd = process.env.TEST_CWD;
+			const first = await SessionManager.createOrResumeExplicit(id, cwd);
+			first.manager.appendMessage({ role: "user", content: "listed conversation", timestamp: 1 });
+			await first.manager.close();
+			const listed = await SessionManager.list(cwd);
+			if (!listed.some(session => session.id === id)) throw new Error("session missing from project listing");
+			const reopened = await SessionManager.createOrResumeExplicit(id, process.env.TEST_OTHER_CWD);
+			if (!reopened.resumed || reopened.manager.getSessionId() !== id) throw new Error("session was not resumed");
+			await reopened.manager.close();`;
+		const child = Bun.spawn([process.execPath, "-e", script], {
+			env: {
+				...process.env,
+				PI_CODING_AGENT_DIR: temp.join("agent"),
+				TEST_ID: ID,
+				TEST_CWD: temp.path(),
+				TEST_OTHER_CWD: path.dirname(temp.path()),
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stderr = await new Response(child.stderr).text();
+		expect({ exit: await child.exited, stderr }).toEqual({ exit: 0, stderr: "" });
 	});
 
 	it("rejects a concurrent process before it can create a second file", async () => {

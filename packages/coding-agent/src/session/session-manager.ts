@@ -4376,7 +4376,9 @@ export class SessionManager {
 					throw new Error(`Session ${id} changed or became corrupt while loading.`);
 				}
 			} else {
-				const dir = sessionDir ? path.resolve(sessionDir) : path.join(root, "explicit");
+				const dir = sessionDir
+					? path.resolve(sessionDir)
+					: SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 				manager = new SessionManager(cwd, dir, true, storage);
 				manager.#resetToNewSession(undefined, path.join(dir, `explicit_${id}.jsonl`), id);
 			}
